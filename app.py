@@ -1,6 +1,10 @@
-﻿import streamlit as st
+import json
+import os
 from datetime import datetime
 from pathlib import Path
+from urllib import error, request
+
+import streamlit as st
 
 st.set_page_config(
     page_title="SecurCoach AI",
@@ -16,6 +20,89 @@ def load_css(file_name: str) -> None:
 
 
 load_css("styles.css")
+
+DEFAULT_GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.0-flash",
+]
+
+
+def get_gemini_api_key() -> str:
+    secrets = getattr(st, "secrets", {})
+    return secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY", "")
+
+
+def get_gemini_models() -> list[str]:
+    secrets = getattr(st, "secrets", {})
+    configured = secrets.get("GEMINI_MODEL") or os.getenv("GEMINI_MODEL", "")
+    if configured:
+        return [configured]
+    return DEFAULT_GEMINI_MODELS
+
+
+def build_system_prompt(domain: str) -> str:
+    return (
+        "You are SecurCoach AI, a cybersecurity study partner for students. "
+        f"The active study domain is {domain}. "
+        "Keep answers concise, educational, and safe. "
+        "Refuse instructions that would enable unauthorized access, malware, exploitation, or evasion. "
+        "When possible, steer the user toward defensive learning, incident response, risk reduction, or exam preparation."
+    )
+
+
+def generate_gemini_reply(user_message: str, domain: str) -> str:
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return (
+            "Gemini is not configured yet. Add `GEMINI_API_KEY` to Streamlit secrets or your environment, "
+            "then rerun the app."
+        )
+
+    payload = {
+        "system_instruction": {"parts": [{"text": build_system_prompt(domain)}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 500,
+        },
+    }
+
+    last_error = "Gemini returned no answer."
+    for model_name in get_gemini_models():
+        req = request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 404:
+                last_error = f"Model `{model_name}` is unavailable. Trying another model."
+                continue
+            return f"Gemini request failed ({exc.code}) on `{model_name}`. {details}"
+        except Exception as exc:
+            return f"Gemini request failed. {exc}"
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            last_error = f"Model `{model_name}` returned no answer."
+            continue
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_parts = [part.get("text", "") for part in parts if part.get("text")]
+        if text_parts:
+            return "\n".join(text_parts).strip()
+
+        last_error = f"Model `{model_name}` returned an empty answer."
+
+    return last_error
+
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -83,13 +170,14 @@ quiz_bank = {
 }
 
 sample_outputs = {
-    "Quiz me": "Sure — here is a 5-question mini quiz on your selected domain. I’ll grade each answer and give hints before revealing the final explanation.",
+    "Quiz me": "Sure - here is a 5-question mini quiz on your selected domain. I will grade each answer and give hints before revealing the final explanation.",
     "Explain a concept": "**Symmetric encryption** uses one shared key for both locking and unlocking information, while **asymmetric encryption** uses a public key and a private key. One is faster for bulk data, while the other is useful for secure exchange and identity verification.",
     "Run a scenario": "Scenario: A help desk employee reports repeated login failures followed by a successful login from a new location. Your first step should be to verify whether this activity is legitimate, review the account logs, and assess whether the account may be compromised.",
 }
 
 st.sidebar.markdown("## 🛡️   SecurCoach AI")
 st.sidebar.caption("Interactive cybersecurity study partner")
+st.sidebar.caption("Gemini status: connected" if get_gemini_api_key() else "Gemini status: missing API key")
 
 selected_domain = st.sidebar.selectbox(
     "Select Study Domain",
@@ -202,16 +290,12 @@ if user_input:
     if "quiz" in lowered:
         st.session_state.quiz_started = True
         reply = f"Absolutely. I can quiz you on **{selected_domain}** and guide you with hints before revealing the answer."
-    elif "explain" in lowered or "difference" in lowered:
-        st.session_state.quiz_started = False
-        reply = sample_outputs["Explain a concept"]
-    elif "scenario" in lowered or "incident" in lowered:
-        st.session_state.quiz_started = False
-        reply = sample_outputs["Run a scenario"]
     elif "hack" in lowered or "bypass" in lowered or "exploit" in lowered:
         reply = "I am an educational tool. I cannot provide instructions for unauthorized access or unethical hacking."
     else:
-        reply = f"You’re currently in **{selected_domain}**. I can quiz you, explain a concept, or run a basic cybersecurity scenario based on this domain."
+        st.session_state.quiz_started = False
+        with st.spinner("Thinking..."):
+            reply = generate_gemini_reply(user_input, selected_domain)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
     st.rerun()
@@ -220,7 +304,7 @@ st.markdown("---")
 col1, col2 = st.columns([2, 1])
 with col1:
     st.markdown(
-        "<div class='foot-note'>Draft prepared for demo purposes — suitable for initial proposal presentation and iterative refinement next week.</div>",
+        "<div class='foot-note'>Draft prepared for demo purposes - suitable for initial proposal presentation and iterative refinement next week.</div>",
         unsafe_allow_html=True,
     )
 with col2:
