@@ -1,0 +1,61 @@
+﻿.stApp {
+    background: linear-gradient(180deg, #0b1220 0%, #0f172a 45%, #111827 100%);
+}
+
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+    border-right: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.section-title {
+    color: #f8fafc;
+    font-weight: 700;
+    font-size: 1.05rem;
+    margin-top: 0.75rem;
+    margin-bottom: 0.65rem;
+}
+
+.quiz-card {
+    background: linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.96));
+    border: 1px solid rgba(96, 165, 250, 0.18);
+    border-left: 5px solid #60a5fa;
+    border-radius: 18px;
+    padding: 1rem 1.1rem;
+    margin: 0.6rem 0 1rem 0;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+.quiz-label {
+    color: #93c5fd;
+    font-weight: 800;
+    font-size: 0.82rem;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.5rem;
+}
+
+.quiz-question {
+    color: #f8fafc;
+    font-size: 1rem;
+    font-weight: 650;
+    margin-bottom: 0.55rem;
+}
+
+.quiz-option {
+    color: #dbeafe;
+    margin: 0.25rem 0;
+    font-size: 0.95rem;
+}
+
+.foot-note {
+    color: #94a3b8;
+    font-size: 0.8rem;
+    margin-top: 0.85rem;
+}
+
+div[data-testid="stChatMessage"] {
+    border-radius: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(15, 23, 42, 0.55);
+    padding-top: 0.2rem;
+    padding-bottom: 0.2rem;
+}
