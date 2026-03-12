@@ -1,0 +1,15 @@
+.login-switch-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--sand);
+  font: inherit;
+  font-weight: 500;
+  border-bottom: 1px solid rgba(148, 137, 121, 0.3);
+  cursor: pointer;
+}
+
+.login-switch-link:hover {
+  color: var(--cream);
+  border-color: var(--cream);
+}

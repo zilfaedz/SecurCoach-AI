@@ -1,0 +1,23 @@
+.signup-panel-right {
+  width: 440px;
+}
+
+.signup-terms-row {
+  margin-bottom: 22px;
+}
+
+.signup-switch-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--sand);
+  font: inherit;
+  font-weight: 500;
+  border-bottom: 1px solid rgba(148, 137, 121, 0.3);
+  cursor: pointer;
+}
+
+.signup-switch-link:hover {
+  color: var(--cream);
+  border-color: var(--cream);
+}
