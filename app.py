@@ -2,7 +2,8 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from urllib import error, request
+from urllib import error, request, parse
+
 
 import streamlit as st
 
@@ -39,6 +40,48 @@ def get_gemini_models() -> list[str]:
     if configured:
         return [configured]
     return DEFAULT_GEMINI_MODELS
+
+
+def get_supabase_config() -> dict[str, str]:
+    secrets = getattr(st, "secrets", {})
+    return {
+        "url": secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL", ""),
+        "key": secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY", ""),
+    }
+
+
+def log_chat_to_supabase(user_message: str, assistant_reply: str, domain: str) -> None:
+    config = get_supabase_config()
+    if not config["url"] or not config["key"] or "your_supabase" in config["url"]:
+        return
+
+    # Using Supabase REST API (PostgREST)
+    table_url = f"{config['url'].rstrip('/')}/rest/v1/chat_history"
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "domain": domain,
+        "user_message": user_message,
+        "assistant_reply": assistant_reply,
+    }
+
+    req = request.Request(
+        table_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "apikey": config["key"],
+            "Authorization": f"Bearer {config['key']}",
+            "Prefer": "return=minimal",
+        },
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=10) as _:
+            pass
+    except Exception as e:
+        # Silently fail or log to console for debugging
+        print(f"Supabase logging failed: {e}")
 
 
 def build_system_prompt(domain: str) -> str:
@@ -296,6 +339,7 @@ if user_input:
         st.session_state.quiz_started = False
         with st.spinner("Thinking..."):
             reply = generate_gemini_reply(user_input, selected_domain)
+            log_chat_to_supabase(user_input, reply, selected_domain)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
     st.rerun()
