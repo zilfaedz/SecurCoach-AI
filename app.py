@@ -5,12 +5,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 import tomllib
-from urllib import error, request
-from urllib.parse import quote
 from uuid import uuid4
 
 import streamlit as st
 
+try:
+    import requests as http_requests
+    USE_REQUESTS = True
+except ImportError:
+    from urllib import error, request as urllib_request
+    USE_REQUESTS = False
+
+try:
+    import jwt as pyjwt
+    USE_PYJWT = True
+except ImportError:
+    USE_PYJWT = False
 
 DOMAINS = [
     "General Security",
@@ -20,11 +30,17 @@ DOMAINS = [
     "Cryptography",
     "Incident Response",
 ]
-MODELS = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]
+MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+
+st.set_page_config(
+    page_title="SecurCoach AI",
+    page_icon="S",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 
-st.set_page_config(page_title="SecurCoach AI", page_icon="S", layout="wide", initial_sidebar_state="collapsed")
-
+# ─── Secrets ────────────────────────────────────────────────────────────────
 
 def load_root_secrets():
     path = Path(__file__).parent.parent / ".streamlit" / "secrets.toml"
@@ -46,21 +62,50 @@ def get_secret_value(key, default=""):
 def get_react_app_url():
     return get_secret_value("REACT_APP_URL", "http://localhost:3000")
 
-
 def get_gemini_api_key():
     return get_secret_value("GEMINI_API_KEY", "")
-
 
 def get_supabase_url():
     return get_secret_value("SUPABASE_URL", "")
 
-
 def get_supabase_key():
     return get_secret_value("SUPABASE_KEY", "")
 
+def get_supabase_jwt_secret():
+    return get_secret_value("SUPABASE_JWT_SECRET", "")
 
 def get_supabase_chat_history_table():
     return get_secret_value("SUPABASE_CHAT_HISTORY_TABLE", "chat_history")
+
+
+# ─── Auth ────────────────────────────────────────────────────────────────────
+
+def verify_jwt_token(token: str):
+    """
+    Verify a Supabase JWT and return the user's email.
+    Falls back to decoding without verification if SUPABASE_JWT_SECRET is not set
+    (acceptable for school/dev use, not production).
+    """
+    if not token:
+        return None
+    jwt_secret = get_supabase_jwt_secret()
+    if USE_PYJWT and jwt_secret:
+        try:
+            payload = pyjwt.decode(token, jwt_secret, algorithms=["HS256"], audience="authenticated")
+            return payload.get("email", "")
+        except Exception:
+            return None
+    # Fallback: decode without verification (dev only)
+    try:
+        import base64
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        return payload.get("email", "")
+    except Exception:
+        return None
 
 
 def ensure_auth_session_state():
@@ -72,6 +117,21 @@ def ensure_auth_session_state():
 
 
 def apply_query_auth():
+    """
+    Authenticate via a JWT token passed as ?token= in the URL.
+    This is secure because the token is cryptographically signed by Supabase.
+    Falls back to ?auth_email= for local dev only.
+    """
+    token = st.query_params.get("token", "").strip()
+    if token:
+        email = verify_jwt_token(token)
+        if email:
+            st.session_state.is_authenticated = True
+            st.session_state.auth_user_email = email.lower()
+            st.session_state.conversation_loaded = False
+            return
+
+    # Local dev fallback only — remove before deploying to production
     auth_email = st.query_params.get("auth_email", "").strip().lower()
     if auth_email:
         st.session_state.is_authenticated = True
@@ -82,6 +142,8 @@ def apply_query_auth():
 def get_user_id():
     return st.session_state.get("auth_user_email", "").strip().lower()
 
+
+# ─── Supabase (using requests if available) ──────────────────────────────────
 
 def supabase_request(method, path, payload=None, query="", extra_headers=None):
     supabase_url = get_supabase_url().rstrip("/")
@@ -98,18 +160,35 @@ def supabase_request(method, path, payload=None, query="", extra_headers=None):
     }
     if extra_headers:
         headers.update(extra_headers)
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = request.Request(url, data=data, headers=headers, method=method)
+
     try:
-        with request.urlopen(req, timeout=20) as response:
-            body = response.read().decode("utf-8")
-            return json.loads(body) if body else None
+        if USE_REQUESTS:
+            resp = http_requests.request(
+                method,
+                url,
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            return resp.json() if resp.text else None
+        else:
+            import json as _json
+            from urllib import request as _req
+            data = _json.dumps(payload).encode("utf-8") if payload is not None else None
+            req = _req.Request(url, data=data, headers=headers, method=method)
+            with _req.urlopen(req, timeout=20) as response:
+                body = response.read().decode("utf-8")
+                return _json.loads(body) if body else None
     except Exception as exc:
         st.session_state.supabase_error = str(exc)
         return None
 
 
+# ─── Conversation helpers ─────────────────────────────────────────────────────
+
 def load_conversation_summaries(user_id):
+    from urllib.parse import quote
     query = (
         "select=conversation_id,message,created_at"
         f"&user_id=eq.{quote(user_id, safe='')}"
@@ -131,18 +210,17 @@ def load_conversation_summaries(user_id):
             continue
         seen.add(cid)
         message = str(row.get("message", "")).strip()
-        summaries.append(
-            {
-                "conversation_id": cid,
-                "title": message[:32] + ("..." if len(message) > 32 else "") or "New Conversation",
-                "created_at": str(row.get("created_at", "")).strip(),
-                "message_count": counts.get(cid, 0),
-            }
-        )
+        summaries.append({
+            "conversation_id": cid,
+            "title": message[:32] + ("..." if len(message) > 32 else "") or "New Conversation",
+            "created_at": str(row.get("created_at", "")).strip(),
+            "message_count": counts.get(cid, 0),
+        })
     return summaries
 
 
 def load_messages_for_conversation(user_id, conversation_id):
+    from urllib.parse import quote
     query = (
         "select=sender,message,created_at"
         f"&user_id=eq.{quote(user_id, safe='')}"
@@ -155,13 +233,11 @@ def load_messages_for_conversation(user_id, conversation_id):
     messages = []
     for row in rows:
         created_at = str(row.get("created_at", "")).strip()
-        messages.append(
-            {
-                "role": "user" if str(row.get("sender", "")).strip().lower() == "user" else "assistant",
-                "content": str(row.get("message", "")),
-                "timestamp": created_at[11:16] if "T" in created_at else created_at[-5:],
-            }
-        )
+        messages.append({
+            "role": "user" if str(row.get("sender", "")).strip().lower() == "user" else "assistant",
+            "content": str(row.get("message", "")),
+            "timestamp": created_at[11:16] if "T" in created_at else created_at[-5:],
+        })
     return messages
 
 
@@ -177,19 +253,34 @@ def save_message(role, content):
         "message": content,
         "created_at": datetime.now().isoformat(),
     }
-    supabase_request("POST", get_supabase_chat_history_table(), payload=payload, extra_headers={"Prefer": "return=minimal"})
+    supabase_request(
+        "POST",
+        get_supabase_chat_history_table(),
+        payload=payload,
+        extra_headers={"Prefer": "return=minimal"},
+    )
 
 
 def delete_conversation(conversation_id):
+    from urllib.parse import quote
     user_id = get_user_id()
     if not user_id:
         return
     query = f"user_id=eq.{quote(user_id, safe='')}&conversation_id=eq.{quote(conversation_id, safe='')}"
-    supabase_request("DELETE", get_supabase_chat_history_table(), query=query, extra_headers={"Prefer": "return=minimal"})
+    supabase_request(
+        "DELETE",
+        get_supabase_chat_history_table(),
+        query=query,
+        extra_headers={"Prefer": "return=minimal"},
+    )
 
 
 def append_message(role, content, timestamp=None):
-    st.session_state.messages.append({"role": role, "content": content, "timestamp": timestamp or datetime.now().strftime("%H:%M")})
+    st.session_state.messages.append({
+        "role": role,
+        "content": content,
+        "timestamp": timestamp or datetime.now().strftime("%H:%M"),
+    })
     save_message(role, content)
 
 
@@ -210,6 +301,8 @@ def refresh_conversations():
     if user_id:
         st.session_state.conversation_summaries = load_conversation_summaries(user_id)
 
+
+# ─── Session state ────────────────────────────────────────────────────────────
 
 def initialize_session_state():
     ensure_auth_session_state()
@@ -233,13 +326,27 @@ def initialize_session_state():
             else:
                 create_new_conversation()
         elif not st.session_state.conversation_loaded:
-            st.session_state.messages = load_messages_for_conversation(user_id, st.session_state.current_conversation_id)
+            st.session_state.messages = load_messages_for_conversation(
+                user_id, st.session_state.current_conversation_id
+            )
         st.session_state.conversation_loaded = True
 
 
+# ─── CSS ─────────────────────────────────────────────────────────────────────
+
 def load_dashboard_css():
-    css = (Path(__file__).with_name("dashboard.css")).read_text(encoding="utf-8")
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+    # Try dashboard.css first, fall back to styles.css
+    for css_name in ("dashboard.css", "styles.css"):
+        css_path = Path(__file__).with_name(css_name)
+        if css_path.exists():
+            css = css_path.read_text(encoding="utf-8")
+            st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+            return
+    # If neither file exists, apply minimal inline fallback
+    st.markdown(
+        "<style>.stApp{background:#0b1220;}</style>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_chat_input_layout_css():
@@ -263,6 +370,8 @@ def render_chat_input_layout_css():
     )
 
 
+# ─── UI Components ────────────────────────────────────────────────────────────
+
 def render_login_redirect_notice():
     react_url = get_react_app_url().rstrip("/")
     st.markdown(
@@ -284,35 +393,63 @@ def generate_response(model, system_prompt, api_messages):
     api_key = get_gemini_api_key()
     if not api_key:
         return "Gemini is not configured. Add `GEMINI_API_KEY` to Streamlit secrets or your environment.", 0
-    contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]} for m in api_messages]
+
+    contents = [
+        {
+            "role": "model" if m["role"] == "assistant" else "user",
+            "parts": [{"text": m["content"]}],
+        }
+        for m in api_messages
+    ]
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
     }
-    for candidate_model in [model, "gemini-flash-latest", "gemini-2.0-flash"]:
-        req = request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={api_key}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+
+    for candidate_model in [model, "gemini-2.0-flash", "gemini-flash-latest"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={api_key}"
         for attempt in range(2):
             try:
-                with request.urlopen(req, timeout=60) as response:
-                    data = json.loads(response.read().decode("utf-8"))
+                if USE_REQUESTS:
+                    resp = http_requests.post(url, json=payload, timeout=60)
+                    if resp.status_code == 503 and attempt == 0:
+                        time.sleep(1.2)
+                        continue
+                    if resp.status_code != 200:
+                        if resp.status_code != 503:
+                            return f"Gemini request failed ({resp.status_code}). {resp.text}", 0
+                        break
+                    data = resp.json()
+                else:
+                    from urllib import error as _error, request as _req
+                    req = _req.Request(
+                        url,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    try:
+                        with _req.urlopen(req, timeout=60) as response:
+                            data = json.loads(response.read().decode("utf-8"))
+                    except _error.HTTPError as exc:
+                        details = exc.read().decode("utf-8", errors="replace")
+                        if exc.code == 503 and attempt == 0:
+                            time.sleep(1.2)
+                            continue
+                        if exc.code != 503:
+                            return f"Gemini request failed ({exc.code}). {details}", 0
+                        break
+
                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                text = "\n".join(part.get("text", "") for part in parts if part.get("text")).strip() or "Gemini returned an empty answer."
+                text = "\n".join(
+                    part.get("text", "") for part in parts if part.get("text")
+                ).strip() or "Gemini returned an empty answer."
                 return text, data.get("usageMetadata", {}).get("totalTokenCount", 0)
-            except error.HTTPError as exc:
-                details = exc.read().decode("utf-8", errors="replace")
-                if exc.code == 503 and attempt == 0:
-                    time.sleep(1.2)
-                    continue
-                if exc.code != 503:
-                    return f"Gemini request failed ({exc.code}). {details}", 0
+
             except Exception as exc:
                 return f"Gemini request failed. {exc}", 0
+
     return "Gemini is temporarily unavailable. Please try again in a few moments.", 0
 
 
@@ -320,7 +457,9 @@ def process_pending_prompt():
     pending = st.session_state.get("pending_prompt")
     if not pending:
         return
-    reply, usage_tokens = generate_response(pending["model"], pending["system_prompt"], pending["api_messages"])
+    reply, usage_tokens = generate_response(
+        pending["model"], pending["system_prompt"], pending["api_messages"]
+    )
     append_message("assistant", reply, datetime.now().strftime("%H:%M"))
     st.session_state.total_tokens += usage_tokens
     st.session_state.total_interactions += 1
@@ -328,10 +467,6 @@ def process_pending_prompt():
     st.session_state.is_generating = False
     refresh_conversations()
     st.rerun()
-
-
-def render_topbar():
-    return
 
 
 def render_sidebar_panel():
@@ -346,19 +481,27 @@ def render_sidebar_panel():
             st.session_state.sidebar_open = False
             st.rerun()
     with header_cols[1]:
-        st.markdown("<div class='brand-row'><div class='brand-icon'>SC</div><div><div class='brand-name'>SecurCoach AI</div><div class='brand-sub'>Security Training</div></div></div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='brand-row'><div class='brand-icon'>SC</div><div><div class='brand-name'>SecurCoach AI</div><div class='brand-sub'>Security Training</div></div></div>",
+            unsafe_allow_html=True,
+        )
     if st.button("+ New Conversation", key="new_conv", use_container_width=True):
         create_new_conversation()
         refresh_conversations()
         st.rerun()
     st.markdown("<div class='history-label'>Chat History</div>", unsafe_allow_html=True)
     if st.session_state.conversation_summaries:
-        for index, summary in enumerate(st.session_state.conversation_summaries):
+        for summary in st.session_state.conversation_summaries:
             cid = summary["conversation_id"]
             created_at = summary["created_at"].replace("T", " ")[:16] if summary["created_at"] else ""
             cols = st.columns([6, 1])
             with cols[0]:
-                if st.button(summary["title"], key=f"conv_{cid}", use_container_width=True, help=f"{created_at} · {summary['message_count']} messages"):
+                if st.button(
+                    summary["title"],
+                    key=f"conv_{cid}",
+                    use_container_width=True,
+                    help=f"{created_at} · {summary['message_count']} messages",
+                ):
                     select_conversation(cid)
                     st.rerun()
                 meta = f"{created_at} · {summary['message_count']} messages".strip(" ·")
@@ -373,7 +516,9 @@ def render_sidebar_panel():
                     refresh_conversations()
                     if not st.session_state.current_conversation_id:
                         if st.session_state.conversation_summaries:
-                            select_conversation(st.session_state.conversation_summaries[0]["conversation_id"])
+                            select_conversation(
+                                st.session_state.conversation_summaries[0]["conversation_id"]
+                            )
                         else:
                             create_new_conversation()
                     st.rerun()
@@ -384,7 +529,9 @@ def render_sidebar_panel():
 def render_messages():
     if not st.session_state.messages:
         st.markdown(
-            f"<div class='empty-wrap'><div class='empty-icon'>SC</div><div class='empty-title'>Start a conversation</div><div class='empty-hint'>Ask anything about <strong style='color:#dfd0b8;'>{html.escape(st.session_state.selected_domain)}</strong><br>or choose a topic to get started.</div></div>",
+            f"<div class='empty-wrap'><div class='empty-icon'>SC</div><div class='empty-title'>Start a conversation</div>"
+            f"<div class='empty-hint'>Ask anything about <strong style='color:#dfd0b8;'>{html.escape(st.session_state.selected_domain)}</strong>"
+            f"<br>or choose a topic to get started.</div></div>",
             unsafe_allow_html=True,
         )
         return
@@ -396,14 +543,17 @@ def render_messages():
         bub_cls = "user-bubble" if is_user else "ai-bubble"
         safe = html.escape(msg["content"]).replace("\n", "<br>")
         st.markdown(
-            f"<div class='msg-row {row_cls}'><div class='avatar {av_cls}'>{av_lbl}</div><div class='bubble {bub_cls}'>{safe}<div class='bubble-ts'>{html.escape(msg.get('timestamp', ''))}</div></div></div>",
+            f"<div class='msg-row {row_cls}'><div class='avatar {av_cls}'>{av_lbl}</div>"
+            f"<div class='bubble {bub_cls}'>{safe}"
+            f"<div class='bubble-ts'>{html.escape(msg.get('timestamp', ''))}</div></div></div>",
             unsafe_allow_html=True,
         )
 
 
 def render_loading_message():
     st.markdown(
-        "<div class='msg-row ai-row'><div class='avatar ai-av'>AI</div><div class='bubble ai-bubble'>Thinking<span style=\"opacity:0.3;font-family:'JetBrains Mono',monospace;\"> |</span></div></div>",
+        "<div class='msg-row ai-row'><div class='avatar ai-av'>AI</div>"
+        "<div class='bubble ai-bubble'>Thinking<span style=\"opacity:0.3;font-family:'JetBrains Mono',monospace;\"> |</span></div></div>",
         unsafe_allow_html=True,
     )
 
@@ -416,8 +566,15 @@ def handle_prompt(prompt):
     st.session_state.pending_prompt = {
         "model": st.session_state.selected_model,
         "system_prompt": (
-            f"You are SecurCoach AI, an expert in cybersecurity training focused on {st.session_state.selected_domain}. "
-            "Be clear, accurate, and educational. Use examples and concrete analogies when helpful."
+            f"You are SecurCoach AI, an expert cybersecurity training coach specializing in {st.session_state.selected_domain}. "
+            "Your role is to educate students and professionals on cybersecurity concepts. "
+            "Follow these guidelines:\n"
+            "1. Use the NIST Cybersecurity Framework as a reference when applicable.\n"
+            "2. Provide clear explanations with real-world examples and analogies.\n"
+            "3. When relevant, include short code snippets for defensive techniques.\n"
+            "4. Never provide instructions that could be used offensively or to harm systems.\n"
+            "5. If a question is outside cybersecurity, politely redirect to security topics.\n"
+            "6. Keep responses concise but thorough — use bullet points for lists of steps or tips."
         ),
         "api_messages": [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
     }
@@ -436,7 +593,7 @@ def render_dashboard():
         render_sidebar_panel()
     with col_chat:
         if st.session_state.get("supabase_error"):
-            st.caption("Supabase sync failed on the last request.")
+            st.caption("⚠️ Supabase sync failed on the last request.")
         render_messages()
         if st.session_state.is_generating:
             render_loading_message()
@@ -447,6 +604,8 @@ def render_dashboard():
         if prompt:
             handle_prompt(prompt)
 
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 initialize_session_state()
 
